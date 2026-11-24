@@ -130,13 +130,30 @@ fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
+/// `path` as a NUL-terminated UTF-16 string for a Win32 call past MAX_PATH: made absolute, then in
+/// the `\\?\` form (`\\?\UNC\` for a network path). A path already in the `\\?\` or `\\.\` form
+/// is returned as it is.
+#[cfg(windows)]
+fn verbatim_wide(path: &Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut w: Vec<u16> = std::path::absolute(path)?.as_os_str().encode_wide().collect();
+    let starts = |w: &[u16], p: &str| w.starts_with(&p.encode_utf16().collect::<Vec<u16>>());
+    if !(starts(&w, r"\\?\") || starts(&w, r"\\.\")) {
+        let (cut, head) = if starts(&w, r"\\") { (2, r"\\?\UNC\") } else { (0, r"\\?\") };
+        w.splice(0..cut, head.encode_utf16());
+    }
+    w.push(0);
+    Ok(w)
+}
+
 fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
-        let src: Vec<u16> = tmp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        let dst: Vec<u16> = dest.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        // MoveFileExW refuses a path of 260 characters or more unless it is in its `\\?\` form
+        // (the files before it go through `std::fs`, which adds the prefix itself).
+        let src = verbatim_wide(tmp)?;
+        let dst = verbatim_wide(dest)?;
         // SAFETY: `src` and `dst` are valid NUL-terminated UTF-16 paths that outlive the call.
         let ok = unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
         if ok != 0 {
@@ -617,6 +634,36 @@ mod tests {
         MODE_MANUAL, PORT_WORK,
     };
     use crate::util::{E_ABORT, E_PENDING};
+
+    #[test]
+    fn a_blob_past_max_path_is_saved() {
+        let root = std::env::temp_dir().join(format!("xcl-gamesave-long-path-{}", std::process::id()));
+        // a component that takes the blob path past 260 characters whatever the temp folder is
+        let dir = root.join("a".repeat(262usize.saturating_sub(root.as_os_str().len() + 8).clamp(1, 255)));
+        let ops = [("data".to_string(), Some(b"v".to_vec()))];
+        let hr = apply(&dir, Some("Long"), &ops);
+        let data = std::fs::read(dir.join("b").join("data")).ok();
+        let display = std::fs::read_to_string(dir.join("display")).ok();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(dir.join("b").join("data").as_os_str().len() > 260 || !cfg!(windows));
+        assert_eq!(hr, S_OK);
+        assert_eq!(data.as_deref(), Some(&b"v"[..]));
+        assert_eq!(display.as_deref(), Some("Long"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_wide_prefixes_each_kind_of_path() {
+        let s = |p: &str| String::from_utf16(&verbatim_wide(Path::new(p)).unwrap().iter().copied().take_while(|&c| c != 0).collect::<Vec<u16>>()).unwrap();
+        assert_eq!(s(r"C:\a\b"), r"\\?\C:\a\b");
+        assert_eq!(s(r"C:\a\..\b"), r"\\?\C:\b");
+        assert_eq!(s(r"\\server\share\f"), r"\\?\UNC\server\share\f");
+        assert_eq!(s(r"\\?\C:\a"), r"\\?\C:\a");
+        assert_eq!(s(r"\\.\C:\a"), r"\\.\C:\a");
+        assert!(verbatim_wide(Path::new("")).is_err());
+        let w = verbatim_wide(Path::new(r"C:\a")).unwrap();
+        assert_eq!(w.last(), Some(&0));
+    }
 
     const DELETE_TEST_NAME: &str = "slot/1";
 
