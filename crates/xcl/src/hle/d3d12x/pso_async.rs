@@ -73,7 +73,17 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
-    complete(p, job());
+    let real = job();
+    if real == DECLINED {
+        // the job is back in `p` (`decline`); a bind that came for it meanwhile has nobody else to build it
+        if p.sent.load(Ordering::Acquire) || p.demand.lock().unwrap().wanted {
+            if let Some(job) = p.job.lock().unwrap().take() {
+                complete(p, job());
+            }
+        }
+    } else {
+        complete(p, real);
+    }
     if preload {
         // (under the lock: `want` does not raise this thread after it)
         let mut d = p.demand.lock().unwrap();
@@ -140,6 +150,22 @@ static FAILED: AtomicUsize = AtomicUsize::new(0);
 
 pub fn enabled() -> bool {
     std::env::var("XCL_ASYNC_PSO").map_or(true, |v| v != "0")
+}
+
+/// What a `Job` returns when it did not build: see `decline`.
+const DECLINED: usize = usize::MAX;
+
+/// Called by a job running on a preload worker that will not build now: `again` takes its place
+/// and waits for the first bind, which builds it as if nothing had been tried. The job returns
+/// this call's result.
+pub fn decline(again: Job) -> usize {
+    match BUILDING.with(|b| b.borrow().clone()) {
+        Some(p) => {
+            *p.job.lock().unwrap() = Some(again);
+            DECLINED
+        }
+        None => 0,
+    }
 }
 
 /// Builds the real pipeline: its raw pointer, 0 = failed.
@@ -427,6 +453,25 @@ mod used_tests {
         assert!(!build_is_wanted(), "this thread builds nothing");
         assert_eq!(resolve_wait_for(standin, None), 0x5353, "the bind's wait reached the build");
         let _ = released(standin);
+    }
+
+    /// A preload worker's job that declines is not lost: it is not done, and the first bind builds it.
+    #[test]
+    fn a_declined_preload_is_built_by_the_first_bind() {
+        let standin = 0x7E57_7005usize;
+        let key = 0x5EED_0005u64;
+        used::earlier_run_used(key);
+        let (tx, rx) = mpsc::channel();
+        submit_lazy(standin, true, Box::new(move || {
+            tx.send(()).unwrap();
+            decline(Box::new(|| 0x4325))
+        }), key);
+        rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the preload worker tried it");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(is_pending(standin), "declined: not built, not failed");
+        assert_eq!(resolve(standin), standin, "still the stand-in");
+        assert_eq!(resolve_wait(standin), 0x4325, "the first bind that waits builds it");
+        released(standin);
     }
 
     #[test]

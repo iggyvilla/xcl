@@ -3336,6 +3336,40 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// DXIL size from which a compute pipeline's driver compile goes to the background
 const BIG_DRIVER_COMPILE: usize = 256 << 10;
 
+thread_local! {
+    /// `translated_compute_pso` left a big build to the first bind (see `preload_skips`)
+    static PRELOAD_DECLINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Hosts with less physical RAM than this (bytes) cannot take an unbounded big driver compile
+/// during preload: #1035 saw 16 GB hosts (Windows RDNA2, Linux RDNA3) grow to 29 – 37 GB of commit
+/// at the title screen, a 32 GB RDNA4 host did not grow.
+const PRELOAD_BIG_RAM: u64 = 24 << 30;
+
+/// Total physical RAM in bytes (`u64::MAX` when it is not known: no gate).
+fn total_ram() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    static T: OnceLock<u64> = OnceLock::new();
+    *T.get_or_init(|| {
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+            u64::MAX
+        } else {
+            m.ullTotalPhys
+        }
+    })
+}
+
+/// On a host with little RAM, a preload worker (`xcl-pso-pre-k`, the lowest priority) does not
+/// start a big driver compile that nobody waits for: the driver's memory in one is not bounded
+/// (a retail title's ~1 MB programs took 16 – 37 GB each; `XCL_PSO_PRELOAD=0` kept the commit
+/// flat) and the commit check before it cannot see that. Its first bind builds it, as without
+/// preload. With more RAM the build goes on: a bind then does not wait for it on the title's thread.
+fn preload_skips(thread: Option<&str>, big: bool, cached: bool, wanted: bool, total_ram: u64) -> bool {
+    total_ram < PRELOAD_BIG_RAM && big && !cached && !wanted && thread.is_some_and(|n| n.starts_with("xcl-pso-pre"))
+}
+
 /// A counting semaphore: background driver compiles of big programs at once.
 struct Slots {
     n: Mutex<usize>,
@@ -3427,6 +3461,19 @@ mod big_compile_tests {
     }
 
     #[test]
+    fn only_a_preload_worker_on_a_small_host_leaves_a_big_unwanted_build_to_the_first_bind() {
+        let (pre, small) = (Some("xcl-pso-pre-0"), 16u64 << 30);
+        assert!(preload_skips(pre, true, false, false, small));
+        assert!(!preload_skips(pre, true, false, false, 32 << 30), "enough RAM: built ahead");
+        assert!(!preload_skips(pre, true, false, false, u64::MAX), "RAM not known: built ahead");
+        assert!(!preload_skips(pre, false, false, false, small), "a small program is built");
+        assert!(!preload_skips(pre, true, true, false, small), "a blob of an earlier build makes it quick");
+        assert!(!preload_skips(pre, true, false, true, small), "the title waits for it");
+        assert!(!preload_skips(Some("xcl-pso-0"), true, false, false, small), "a bind's worker builds it");
+        assert!(!preload_skips(None, true, false, false, small));
+    }
+
+    #[test]
     fn unwanted_builds_go_one_at_a_time_when_the_commit_is_there() {
         static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
         let first = big_compile_turn(&S, || true, || false).expect("its turn");
@@ -3486,6 +3533,14 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     }
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+    }
+    if preload_skips(std::thread::current().name(), big, cached.is_some(), super::pso_async::build_is_wanted(), total_ram()) {
+        static ONCE: AtomicU64 = AtomicU64::new(0);
+        if ONCE.fetch_add(1, Ordering::Relaxed) == 0 {
+            crate::xlog_info!("D3D12.X: preload leaves the driver compile of a big compute program ({} B DXIL) to its first bind", dxil.len());
+        }
+        PRELOAD_DECLINED.with(|c| c.set(true));
+        return Some(Err(()));
     }
     // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
     let _slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso")))
@@ -4117,20 +4172,28 @@ unsafe fn go_background(
     }
     let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
-    let job: super::pso_async::Job = Box::new(move || {
-        let mut out: *mut c_void = std::ptr::null_mut();
-        if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
-            out as usize
-        } else {
-            0
-        }
-    });
+    let job = build_job(dev, owned, build);
     if super::pso_async::lazy() {
         super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
     } else {
         super::pso_async::submit(*ppv as usize, compute, job);
     }
     Some(hr)
+}
+
+/// The worker's job for a pipeline: builds it; when a preload worker declines a big build
+/// (`preload_skips`), the job is put back for the first bind (`pso_async::decline`).
+fn build_job(dev: Dev, owned: OwnedDesc, build: unsafe fn(Dev, &OwnedDesc, *mut *mut c_void) -> bool) -> super::pso_async::Job {
+    Box::new(move || {
+        let mut out: *mut c_void = std::ptr::null_mut();
+        if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
+            out as usize
+        } else if PRELOAD_DECLINED.with(|c| c.replace(false)) {
+            super::pso_async::decline(build_job(dev, owned, build))
+        } else {
+            0
+        }
+    })
 }
 
 unsafe fn build_graphics(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
