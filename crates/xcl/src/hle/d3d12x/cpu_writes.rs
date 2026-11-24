@@ -90,6 +90,15 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
 
 /// The dwords at `va`, if the memory is still there and writable.
 unsafe fn write_now(va: usize, words: &[u32]) {
+    // pages the working set holds read-write need no `VirtualQuery`, which sizes the title's whole
+    // block of memory around them (milliseconds a write in a retail game's multi-GB block)
+    let bytes = 4 * words.len();
+    if bytes != 0 && crate::gpu::shader::resident_and_writable(va, bytes) {
+        for (i, &w) in words.iter().enumerate() {
+            (*((va + 4 * i) as *const AtomicU32)).store(w, Ordering::Release);
+        }
+        return;
+    }
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
     let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
     if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
@@ -105,6 +114,10 @@ unsafe fn write_now(va: usize, words: &[u32]) {
 
 /// An 8-byte aligned 64-bit value at `va`, if the memory is still there and writable.
 unsafe fn write_u64_now(va: usize, value: u64) {
+    if crate::gpu::shader::resident_and_writable(va, 8) {
+        (*(va as *const AtomicU64)).store(value, Ordering::Release);
+        return;
+    }
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
     let Some(end) = va.checked_add(8) else { return };
     let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
@@ -120,6 +133,10 @@ unsafe fn write_u64_now(va: usize, value: u64) {
 /// Whether `[va, va + bytes)` is memory the CPU can write for the GPU later.
 pub(super) fn writable(va: usize, bytes: usize) -> bool {
     crate::hle::kernelx::lazy::ensure(va, bytes);
+    // (a lazy page just committed is not in the working set yet: it takes the walk below)
+    if crate::gpu::shader::resident_and_writable(va, bytes) {
+        return true;
+    }
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let found = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
@@ -166,6 +183,76 @@ mod tests {
     use super::*;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     use windows::Win32::Graphics::Dxgi::*;
+
+    /// Four pages: 0 and 1 read-write and written, 2 read-write and never touched, 3 read-only.
+    unsafe fn pages_for_checks() -> usize {
+        use windows_sys::Win32::System::Memory::*;
+        let base = VirtualAlloc(std::ptr::null(), 4 << 12, MEM_RESERVE, PAGE_NOACCESS) as usize;
+        assert_ne!(base, 0);
+        for (k, protect) in [(0, PAGE_READWRITE), (1, PAGE_READWRITE), (2, PAGE_READWRITE), (3, PAGE_READONLY)] {
+            assert!(!VirtualAlloc((base + (k << 12)) as *const _, 1 << 12, MEM_COMMIT, protect).is_null());
+        }
+        std::ptr::write_volatile(base as *mut u8, 1);
+        std::ptr::write_volatile((base + (1 << 12)) as *mut u8, 1);
+        base
+    }
+
+    /// Resident read-write pages are answered from the working set, anything else by the walk –
+    /// the same answers as `VirtualQuery` alone gave.
+    #[test]
+    fn writable_answers_the_same_with_the_working_set_first() {
+        use windows_sys::Win32::System::Memory::*;
+        unsafe {
+            let base = pages_for_checks();
+            let page = |k: usize| base + (k << 12);
+            assert!(writable(page(0), 8));
+            assert!(writable(page(0) + 0xFF8, 16), "a write across two resident read-write pages");
+            // committed read-write but never touched: not resident, the walk says yes
+            assert!(writable(page(2), 8));
+            assert!(!writable(page(3), 8));
+            assert!(!writable(page(1) + 0xFF8, 0x1010), "a range that runs into a read-only page");
+            assert!(VirtualProtect(page(1) as *const _, 1 << 12, PAGE_READONLY, &mut 0) != 0);
+            assert!(!writable(page(1), 8), "a page made read-only after it was resident");
+            assert!(VirtualFree(page(0) as *mut _, 1 << 12, MEM_DECOMMIT) != 0);
+            assert!(!writable(page(0), 8), "a page decommitted after it was resident");
+            VirtualFree(base as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// The worker looks again before it stores: a page that went read-only or away since
+    /// `writable` said yes is left alone, a resident one gets the value.
+    #[test]
+    fn the_worker_checks_the_memory_again_before_storing() {
+        use windows_sys::Win32::System::Memory::*;
+        unsafe {
+            let base = pages_for_checks();
+            let page = |k: usize| base + (k << 12);
+            let word = |a: usize| (*(a as *const AtomicU32)).load(Ordering::Acquire);
+            write_now(page(0), &[7, 9]);
+            assert_eq!((word(page(0)), word(page(0) + 4)), (7, 9));
+            write_now(page(1) + 0xFFC, &[5]);
+            assert_eq!(word(page(1) + 0xFFC), 5);
+            write_now(page(2), &[3]); // never touched: the walk
+            assert_eq!(word(page(2)), 3);
+            write_u64_now(page(0) + 8, 0x1122_3344_5566_7788);
+            assert_eq!(*((page(0) + 8) as *const u64), 0x1122_3344_5566_7788);
+            // a store across the end of the writable pages does not happen at all
+            write_now(page(2) + 0xFFC, &[1, 2]);
+            assert_eq!(word(page(2) + 0xFFC), 0);
+            write_now(page(3), &[1]);
+            write_u64_now(page(3), 1);
+            assert_eq!(word(page(3)), 0);
+            assert!(VirtualProtect(page(0) as *const _, 1 << 12, PAGE_READONLY, &mut 0) != 0);
+            write_now(page(0), &[1]);
+            write_u64_now(page(0) + 8, 2);
+            assert_eq!((word(page(0)), *((page(0) + 8) as *const u64)), (7, 0x1122_3344_5566_7788));
+            assert!(VirtualFree(page(1) as *mut _, 1 << 12, MEM_DECOMMIT) != 0);
+            write_now(page(1), &[1]); // gone: nothing may fault
+            write_u64_now(page(1), 1);
+            write_now(0, &[1]);
+            VirtualFree(base as *mut _, 0, MEM_RELEASE);
+        }
+    }
 
     /// The value lands after the queue has done what came before it.
     #[test]
