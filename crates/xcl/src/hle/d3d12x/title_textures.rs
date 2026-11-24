@@ -708,6 +708,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
         dirty.sort_unstable();
         dirty.len()
     });
+    if page == 0 {
+        page = 0x1000; // defensive: the page arithmetic below divides by it
+    }
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
@@ -751,7 +754,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
-    let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
+    let todo: Vec<(ID3D12Resource, Upload, bool, Vec<usize>)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
         t.by_res
@@ -763,24 +766,39 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 if e.gpu_written {
                     return false;
                 }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
+                !dirty_in(&dirty, page as usize, e.src, e.src + e.tex.size() as usize).is_empty()
             })
             .filter_map(|(&res, e)| {
+                let first = e.pending;
                 if e.pending {
                     e.pending = false;
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
+                // the pages the write watch reported in this texture's bytes
+                // (only what `look_at` reads: not for a first upload, nor with the skip off)
+                let reported = if first || !unchanged_skip() { &[][..] } else { dirty_in(&dirty, page as usize, e.src, e.src + e.tex.size() as usize) };
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone()), first, reported.to_vec()))
             })
             .collect()
     });
-    upload_all(todo);
+    upload_all(todo, page as usize);
 }
 
-/// texture → `content_hash` of its memory at its last upload
-static LAST_CONTENT: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+/// What a texture's memory held at its last successful upload: one `content_hash` per write-watch
+/// page of its bytes, so a look hashes only the pages the write watch reported (8 bytes per 4 KiB).
+struct LastContent {
+    /// the write watch's page size these hashes are per
+    page: usize,
+    /// the texture's first byte and its length
+    start: usize,
+    size: usize,
+    /// one per page of `[start, start + size)`, over the texture's part of the page
+    hashes: Box<[u64]>,
+}
+
+/// texture → what its memory held at its last upload
+static LAST_CONTENT: Mutex<BTreeMap<usize, Arc<LastContent>>> = Mutex::new(BTreeMap::new());
 static UNCHANGED: AtomicU64 = AtomicU64::new(0);
 
 /// `XCL_TEXTURE_SKIP_UNCHANGED=0` uploads a texture whenever its pages were written, as before.
@@ -789,10 +807,140 @@ fn unchanged_skip() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_TEXTURE_SKIP_UNCHANGED").map_or(true, |v| v.trim() != "0"))
 }
 
-/// Whether texture `res` was last uploaded from memory with hash `h`; `h` is remembered as its
-/// content from here on (the caller uploads it when this is false).
-fn same_as_last_upload(res: usize, h: u64) -> bool {
-    LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
+/// What a texture's remembered content becomes when its upload has succeeded.
+enum Remember {
+    /// nothing to remember (its first upload hashes nothing)
+    Nothing,
+    /// no usable baseline: all pages hashed before the upload
+    All(LastContent),
+    /// the dirty pages (index from the texture's first page, hash) that differ from `.0`
+    Pages(Arc<LastContent>, Vec<(usize, u64)>),
+}
+
+impl LastContent {
+    /// Whether these hashes describe a texture of `size` bytes at `start` for write-watch pages of `page`.
+    fn fits(&self, start: usize, size: usize, page: usize) -> bool {
+        self.page == page && self.start == start && self.size == size && self.hashes.len() == pages_spanned(start, size, page)
+    }
+}
+
+/// How many write-watch pages the bytes `[start, start + size)` span.
+fn pages_spanned(start: usize, size: usize, page: usize) -> usize {
+    if size == 0 { 0 } else { (start + size - 1) / page - start / page + 1 }
+}
+
+/// The part of page number `i` (from the one holding `start`) that lies in `[start, start + size)`.
+fn page_part(start: usize, size: usize, page: usize, i: usize) -> (usize, usize) {
+    let base = start / page * page + i * page;
+    (base.max(start), (base + page).min(start + size))
+}
+
+/// One hash per page of `[start, start + size)` over the texture's part of it, from `mem`, the
+/// texture's bytes. A neighbour sharing a page does not change the hash.
+fn page_hashes(start: usize, size: usize, page: usize, mem: &[u8]) -> Box<[u64]> {
+    (0..pages_spanned(start, size, page))
+        .map(|i| {
+            let (lo, hi) = page_part(start, size, page, i);
+            content_hash(&mem[lo - start..hi - start])
+        })
+        .collect()
+}
+
+/// The pages of `dirty` (sorted page bases) that overlap `[start, start + size)`, as page numbers
+/// from the one holding `start`, in runs of consecutive pages: `(first, count)`.
+fn dirty_runs(start: usize, size: usize, page: usize, dirty: &[usize]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let first = start / page * page;
+    for &p in dirty {
+        if p + page <= start || p >= start + size {
+            continue;
+        }
+        let i = (p - first) / page;
+        match runs.last_mut() {
+            Some((f, n)) if *f + *n == i => *n += 1,
+            _ => runs.push((i, 1)),
+        }
+    }
+    runs
+}
+
+/// The pages of `dirty` (sorted page bases, `page` bytes each) that overlap `[lo, hi)`.
+fn dirty_in(dirty: &[usize], page: usize, lo: usize, hi: usize) -> &[usize] {
+    let from = dirty.partition_point(|&p| p + page <= lo);
+    let to = dirty.partition_point(|&p| p < hi);
+    &dirty[from..to.max(from)]
+}
+
+/// The dirty pages of a texture whose bytes differ from `last`, as (page number, new hash); empty
+/// when it is as at its last upload. Each run of dirty pages is read once with `read(at, len)`;
+/// pages that were not reported are not read.
+fn changed_pages(start: usize, size: usize, page: usize, dirty: &[usize], last: &LastContent, read: &dyn Fn(usize, usize) -> std::borrow::Cow<'static, [u8]>) -> Vec<(usize, u64)> {
+    let mut changed = Vec::new();
+    for (first, n) in dirty_runs(start, size, page, dirty) {
+        let (lo, _) = page_part(start, size, page, first);
+        let (_, hi) = page_part(start, size, page, first + n - 1);
+        let mem = read(lo, hi - lo);
+        for i in first..first + n {
+            let (a, b) = page_part(start, size, page, i);
+            let h = content_hash(&mem[a - lo..b - lo]);
+            if h != last.hashes[i] {
+                changed.push((i, h));
+            }
+        }
+    }
+    changed
+}
+
+/// Whether texture `res` (bytes `[start, start + size)`) is uploaded now, and what is remembered
+/// when that has succeeded; `None` when its memory is as at its last upload. A texture's first
+/// upload hashes nothing (its memory cannot match anything); one without a usable baseline is
+/// hashed whole once; otherwise only the pages in `dirty` are read.
+unsafe fn look_at(res: usize, start: usize, size: usize, page: usize, first: bool, dirty: &[usize]) -> Option<Remember> {
+    if first {
+        LAST_CONTENT.lock().unwrap().remove(&res);
+        return Some(Remember::Nothing);
+    }
+    let last = LAST_CONTENT.lock().unwrap().get(&res).cloned();
+    match last.filter(|l| l.fits(start, size, page)) {
+        Some(last) => {
+            let changed = changed_pages(start, size, page, dirty, &last, &|at, len| title_bytes(at, len));
+            (!changed.is_empty()).then_some(Remember::Pages(last, changed))
+        }
+        None => Some(Remember::All(LastContent { page, start, size, hashes: page_hashes(start, size, page, &title_bytes(start, size)) })),
+    }
+}
+
+/// After a batch: remember what the uploads that succeeded sent; the ones at the indices
+/// `failed_at` (in the batch's order) lose their baseline.
+fn settle(remembers: Vec<(usize, Remember)>, failed_at: &[usize]) {
+    for (k, (res, rem)) in remembers.into_iter().enumerate() {
+        if failed_at.contains(&k) {
+            LAST_CONTENT.lock().unwrap().remove(&res);
+        } else {
+            remember(res, rem);
+        }
+    }
+}
+
+/// Remember what texture `res` held when it was uploaded (the upload succeeded).
+fn remember(res: usize, r: Remember) {
+    let mut m = LAST_CONTENT.lock().unwrap();
+    match r {
+        Remember::Nothing => {}
+        Remember::All(l) => {
+            m.insert(res, Arc::new(l));
+        }
+        Remember::Pages(last, changed) => {
+            // forgotten (or replaced) while it was uploaded: its baseline is not this one any more
+            if m.get(&res).is_some_and(|cur| Arc::ptr_eq(cur, &last)) {
+                let mut hashes = last.hashes.clone();
+                for (i, h) in changed {
+                    hashes[i] = h;
+                }
+                m.insert(res, Arc::new(LastContent { page: last.page, start: last.start, size: last.size, hashes }));
+            }
+        }
+    }
 }
 
 /// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
@@ -818,7 +966,7 @@ fn content_hash(b: &[u8]) -> u64 {
 const BATCH_BYTES: usize = 256 << 20;
 
 /// The uploads `todo`, in batches of up to `BATCH_BYTES` (one list and one wait each).
-unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
+unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload, bool, Vec<usize>)>, page: usize) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -830,24 +978,26 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         let mut picked = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
-        while let Some((_, (dev, _, tex, _))) = todo.peek() {
+        let mut remembers = Vec::new();
+        while let Some((_, (dev, _, tex, _), _, _)) = todo.peek() {
             if !picked.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
                 break;
             }
-            let (r, (dev, va, tex, states)) = todo.next().unwrap();
+            let (r, (dev, va, tex, states), first, dirty) = todo.next().unwrap();
             // The same bytes as at this texture's last upload: nothing to do. The write watch is
             // per page and a title writes next to its textures (and rewrites what it wrote): a
             // retail title's video planes and UI targets went up again for every submit, ~25 MB
             // a presented frame where ~3 MB had changed, and the submits waited here.
             if unchanged_skip() {
-                let h = content_hash(&title_bytes(va, tex.size() as usize));
-                if same_as_last_upload(r.as_raw() as usize, h) {
+                let res = r.as_raw() as usize;
+                let Some(rem) = look_at(res, va, tex.size() as usize, page, first, &dirty) else {
                     let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || (n.is_power_of_two() && n >= 1024) {
                         crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
                     }
                     continue;
-                }
+                };
+                remembers.push((res, rem));
             }
             device = dev;
             bytes += tex.size() as usize;
@@ -861,12 +1011,26 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
             batch.push((r, subs, states));
         }
+        // what is remembered of these textures is what the GPU received: only the uploads that
+        // succeed are remembered. A failed one loses its baseline, so the next time the title
+        // writes it, it is uploaded in full; as before, a failure does not retry by itself (its
+        // dirty pages are consumed; #504.3's retry gap is not part of this change)
+        let forget_all = |remembers: &[(usize, Remember)]| {
+            let mut m = LAST_CONTENT.lock().unwrap();
+            for (res, _) in remembers {
+                m.remove(res);
+            }
+        };
         let d = device as *mut c_void;
-        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else {
+            forget_all(&remembers);
+            continue;
+        };
         let queue = match upload_queue(dev, device) {
             Ok(q) => q,
             Err(e) => {
                 warn(&e);
+                forget_all(&remembers);
                 continue;
             }
         };
@@ -875,12 +1039,18 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             texture::upload_batch(dev, &queue, &batch)
         }) {
             Ok(failed) => {
-                for (_, e) in failed {
+                let mut failed_at = Vec::new();
+                for (k, e) in failed {
                     warn(&e);
+                    failed_at.push(k);
                 }
                 UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                settle(remembers, &failed_at);
             }
-            Err(e) => warn(&e),
+            Err(e) => {
+                warn(&e);
+                forget_all(&remembers);
+            }
         }
     }
 }
@@ -1183,33 +1353,179 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 mod tests {
     use super::*;
 
-    /// A texture is left out only when its memory hashes as at its own last upload, and a
-    /// texture that was forgotten (released, or its address registered again) is uploaded again.
+    const PG: usize = 0x1000;
+
+    /// A texture's baseline from `mem` (its bytes at `start`), as `look_at` would remember it.
+    fn baseline(start: usize, mem: &[u8]) -> LastContent {
+        LastContent { page: PG, start, size: mem.len(), hashes: page_hashes(start, mem.len(), PG, mem) }
+    }
+
+    /// The reader `changed_pages` is given over a fake memory at `base`; records what it was asked for.
+    fn changed(start: usize, mem: &[u8], dirty: &[usize], last: &LastContent, reads: &std::cell::RefCell<Vec<(usize, usize)>>) -> Vec<(usize, u64)> {
+        changed_pages(start, mem.len(), PG, dirty, last, &|at, len| {
+            reads.borrow_mut().push((at, len));
+            std::borrow::Cow::Owned(mem[at - start..at - start + len].to_vec())
+        })
+    }
+
     #[test]
-    fn a_texture_with_unchanged_memory_is_left_out_until_it_is_forgotten() {
-        let (a, b) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize);
-        let mut mem = vec![0u8; 3 << 20];
-        mem[5] = 1;
-        let h = content_hash(&mem);
-        assert!(!same_as_last_upload(a, h), "the first upload is not left out");
-        assert!(same_as_last_upload(a, h), "the same bytes again: left out");
-        assert!(!same_as_last_upload(b, h), "another texture over the same bytes has its own first upload");
-        // one byte anywhere, also in the tail that is not a whole 32-byte step
-        for at in [0usize, 31, 32, (3 << 20) - 1] {
-            let mut m = mem.clone();
-            m[at] ^= 0x80;
-            assert_ne!(content_hash(&m), h, "byte {at} changed");
+    fn page_hashes_cover_each_page_of_the_texture_once() {
+        let (start, size) = (0x7E57_0000_1F00usize, 5 * PG - 0x1200);
+        assert_eq!(pages_spanned(start, size, PG), 5);
+        assert_eq!(pages_spanned(0x1000, 0x1000, PG), 1);
+        assert_eq!(pages_spanned(0x1000, 0x1001, PG), 2);
+        assert_eq!(pages_spanned(0x1fff, 2, PG), 2);
+        assert_eq!(pages_spanned(0x1000, 0, PG), 0);
+        let mem = vec![7u8; size];
+        let h = page_hashes(start, size, PG, &mem);
+        assert_eq!(h.len(), 5);
+        // a byte in each page changes that page's hash only
+        for i in 0..5 {
+            let (lo, hi) = page_part(start, size, PG, i);
+            for at in [lo, hi - 1] {
+                let mut m = mem.clone();
+                m[at - start] ^= 1;
+                let h2 = page_hashes(start, size, PG, &m);
+                for k in 0..5 {
+                    assert_eq!(h2[k] != h[k], k == i, "byte {at:#x} (page {i}) vs page {k}");
+                }
+            }
         }
-        mem[(3 << 20) - 1] = 9;
-        let h2 = content_hash(&mem);
-        assert!(!same_as_last_upload(a, h2), "changed memory is uploaded");
-        assert!(same_as_last_upload(a, h2));
-        // the length is part of the content: a prefix of zeros is not the whole
-        assert_ne!(content_hash(&[0u8; 64]), content_hash(&[0u8; 96]));
+        // the parts of the pages tile the texture
+        assert_eq!(page_part(start, size, PG, 0).0, start);
+        assert_eq!(page_part(start, size, PG, 4).1, start + size);
+    }
+
+    #[test]
+    fn a_page_shared_with_a_neighbour_does_not_invalidate_the_texture() {
+        // a texture of the second half of a page and the first of the next; a neighbour owns the rest
+        let mut ram = vec![0u8; 3 * PG];
+        let (start, size) = (PG / 2, PG);
+        let last = baseline(start, &ram[start..start + size]);
+        // the neighbour's bytes change, both pages are reported
+        ram[0] = 1;
+        ram[2 * PG - 1] = 2;
+        let reads = Default::default();
+        assert!(changed(start, &ram[start..start + size], &[0, PG, 2 * PG], &last, &reads).is_empty());
+        // its own byte does
+        ram[start + 3] = 9;
+        let c = changed(start, &ram[start..start + size], &[0, PG], &last, &reads);
+        assert_eq!(c.iter().map(|&(i, _)| i).collect::<Vec<_>>(), [0]);
+    }
+
+    #[test]
+    fn dirty_runs_read_consecutive_pages_once_and_clip_to_the_texture() {
+        let (start, size) = (3 * PG + 0x800, 8 * PG);
+        let p0 = 3 * PG;
+        // PG and p0 + 9 * PG (past the end) and p0 + 20 * PG do not overlap the bytes
+        let dirty = [PG, p0, p0 + PG, p0 + 2 * PG, p0 + 5 * PG, p0 + 8 * PG, p0 + 9 * PG, p0 + 20 * PG];
+        assert_eq!(dirty_runs(start, size, PG, &dirty), [(0, 3), (5, 1), (8, 1)]);
+        assert_eq!(dirty_runs(start, size, PG, &[]), []);
+        assert_eq!(dirty_runs(start, size, PG, &[start + size]), []);
+        // one read per run, clipped to the texture
+        let ram = vec![0u8; size];
+        let last = baseline(start, &ram);
+        let reads = std::cell::RefCell::new(Vec::new());
+        assert!(changed(start, &ram, &dirty, &last, &reads).is_empty());
+        assert_eq!(*reads.borrow(), [(start, 3 * PG - 0x800), (p0 + 5 * PG, PG), (p0 + 8 * PG, 0x800)]);
+    }
+
+    #[test]
+    fn only_the_reported_pages_are_hashed_and_only_changed_ones_are_remembered() {
+        let (start, size) = (0x20_000usize, 4 * PG);
+        let mut ram = vec![0u8; size];
+        let mut last = baseline(start, &ram);
+        let reads = std::cell::RefCell::new(Vec::new());
+        // a page that was not reported changed: the write watch, not the bytes, says what to look at
+        ram[PG + 1] = 1;
+        assert!(changed(start, &ram, &[start + 3 * PG], &last, &reads).is_empty());
+        assert_eq!(*reads.borrow(), [(start + 3 * PG, PG)], "only the reported page was read");
+        // the same bytes written again: left out
+        assert!(changed(start, &ram, &[start + 3 * PG, start + 2 * PG], &last, &reads).is_empty());
+        // a reported page that differs
+        let c = changed(start, &ram, &[start + PG], &last, &reads);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].0, 1);
+        // applying it changes that page's hash only, and the next look is "unchanged"
+        let before = last.hashes.clone();
+        for &(i, h) in &c {
+            last.hashes[i] = h;
+        }
+        for i in 0..4 {
+            assert_eq!(last.hashes[i] != before[i], i == 1);
+        }
+        assert!(changed(start, &ram, &[start + PG], &last, &reads).is_empty());
+    }
+
+    #[test]
+    fn dirty_in_finds_the_pages_that_overlap_a_texture_starting_inside_a_page() {
+        let d = [0x1000usize, 0x2000, 0x5000];
+        // starts in the middle of the first page, ends in the middle of the second
+        assert_eq!(dirty_in(&d, PG, 0x1800, 0x2800), [0x1000, 0x2000]);
+        assert_eq!(dirty_in(&d, PG, 0x1fff, 0x2000), [0x1000], "its last byte only");
+        assert_eq!(dirty_in(&d, PG, 0x3000, 0x5000), [0usize; 0], "ends where the dirty page begins");
+        assert_eq!(dirty_in(&d, PG, 0x2000, 0x2800), [0x2000]);
+        assert_eq!(dirty_in(&d, PG, 0x6000, 0x7000), [0usize; 0]);
+        assert_eq!(dirty_in(&[0usize; 0], PG, 0, 0x1000), [0usize; 0]);
+    }
+
+    #[test]
+    fn only_the_uploads_that_succeeded_are_remembered() {
+        let (a, b, c) = (0x7E57_0000_3000usize, 0x7E57_0000_4000usize, 0x7E57_0000_5000usize);
+        let l = || LastContent { page: PG, start: 0x1000, size: PG, hashes: Box::new([1]) };
+        remember(b, Remember::All(l())); // b had a baseline from an earlier upload
+        settle(vec![(a, Remember::All(l())), (b, Remember::All(l())), (c, Remember::All(l()))], &[1]);
+        let m = LAST_CONTENT.lock().unwrap();
+        assert!(m.contains_key(&a) && m.contains_key(&c));
+        assert!(!m.contains_key(&b), "the failed one lost its baseline");
+        drop(m);
+        for r in [a, b, c] {
+            forget(r);
+        }
+    }
+
+    #[test]
+    fn a_baseline_fits_only_the_texture_and_granularity_it_was_made_for() {
+        let l = baseline(0x1000, &[0u8; 3 * PG]);
+        assert!(l.fits(0x1000, 3 * PG, PG));
+        assert!(!l.fits(0x2000, 3 * PG, PG), "moved");
+        assert!(!l.fits(0x1000, 4 * PG, PG), "longer");
+        assert!(!l.fits(0x1000, 3 * PG - 0x100, PG), "shorter within the same pages");
+        assert!(!l.fits(0x1000, 3 * PG, 0x2000), "another page size");
+    }
+
+    /// A first upload hashes nothing and drops a baseline left over from before; what is
+    /// remembered follows the upload's success; the texture's baseline goes with `forget`.
+    #[test]
+    fn baselines_are_remembered_after_the_upload_and_forgotten_with_the_texture() {
+        let (a, b) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize);
+        let mut mem = vec![0u8; 3 * PG];
+        mem[5] = 1;
+        let l = |m: &[u8]| baseline(0x40_0000, m);
+        // an upload whose baseline is not remembered (it failed) leaves nothing
+        assert!(LAST_CONTENT.lock().unwrap().get(&a).is_none());
+        remember(a, Remember::All(l(&mem)));
+        assert!(LAST_CONTENT.lock().unwrap().get(&a).is_some());
+        // a first upload (the texture was remapped) drops it and hashes nothing: look_at reads no memory
+        assert!(matches!(unsafe { look_at(a, 0x40_0000, 3 * PG, PG, true, &[]) }, Some(Remember::Nothing)));
+        assert!(LAST_CONTENT.lock().unwrap().get(&a).is_none());
+        // a changed page is applied to the baseline it was compared with only
+        remember(a, Remember::All(l(&mem)));
+        let old = LAST_CONTENT.lock().unwrap().get(&a).cloned().unwrap();
+        remember(b, Remember::All(l(&mem)));
+        mem[PG + 1] = 5;
+        let h = page_hashes(0x40_0000, 3 * PG, PG, &mem)[1];
+        remember(a, Remember::Pages(Arc::clone(&old), vec![(1, h)]));
+        let now = LAST_CONTENT.lock().unwrap().get(&a).cloned().unwrap();
+        assert_eq!(now.hashes[1], h);
+        assert_eq!((now.hashes[0], now.hashes[2]), (old.hashes[0], old.hashes[2]));
+        // a baseline replaced while the upload ran is not resurrected by it
         forget(a);
-        assert!(!same_as_last_upload(a, h2), "forgotten: its next upload is a first one");
-        forget(a);
+        remember(a, Remember::Pages(old, vec![(1, 0)]));
+        assert!(LAST_CONTENT.lock().unwrap().get(&a).is_none(), "forgotten: the next upload is a first one");
+        assert!(LAST_CONTENT.lock().unwrap().get(&b).is_some(), "another texture has its own");
         forget(b);
+        assert!(LAST_CONTENT.lock().unwrap().get(&b).is_none());
     }
 
     /// Real uploads, dirty-page detection and a source changing after registration:
@@ -1326,6 +1642,19 @@ mod tests {
                 assert_eq!(read_r8(dev, &queue, &texture), vec![value; 64 * 64], "GPU contents follow CPU writes");
                 assert_eq!(address(key), Some(va), "the title address stays in the GPU view");
             }
+            // the same bytes written again are not uploaded again; other bytes are, once
+            let uploads = || counts().1;
+            let before = uploads();
+            std::ptr::write_bytes(src as *mut u8, 0x9A, PAGE);
+            refresh(queue.as_raw());
+            assert_eq!(uploads(), before, "the same bytes again: no upload");
+            std::ptr::write_bytes(src as *mut u8, 0x4E, 16);
+            refresh(queue.as_raw());
+            assert_eq!(uploads(), before + 1, "other bytes: one upload");
+            std::ptr::write_bytes(src as *mut u8, 0x9A, 16);
+            refresh(queue.as_raw());
+            assert_eq!(uploads(), before + 2);
+            assert_eq!(read_r8(dev, &queue, &texture), vec![0x9A; 64 * 64]);
             let (mut count, mut id) = (1usize, 0usize);
             assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, &mut id), 1);
             let mut mapped = PhysicalPage { id, at: va };
