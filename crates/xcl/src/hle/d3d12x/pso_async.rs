@@ -358,10 +358,9 @@ pub fn submit(standin: usize, compute: bool, job: Job) {
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
-/// their stand-in when made and are built when first used – the first bind of a graphics one
-/// sends it to the workers, a compute one is built at its first bind. A retail game makes
-/// ~51 000 pipelines in its first 30 s and uses few; each one built stays in the driver
-/// (~400 KB), and the process ran out of commit.
+/// their stand-in when made and are built when first used – the first bind of one sends it to
+/// the workers. A retail game makes ~51 000 pipelines in its first 30 s and uses few; each one
+/// built stays in the driver (~400 KB), and the process ran out of commit.
 pub fn lazy() -> bool {
     static L: OnceLock<bool> = OnceLock::new();
     *L.get_or_init(|| enabled() && std::env::var("XCL_LAZY_PSO").map_or(true, |v| v != "0"))
@@ -414,11 +413,11 @@ pub fn earlier_used_keys() -> std::collections::HashSet<u64> {
 /// (`used-pipelines.txt` beside the DXIL cache, a key a line).
 ///
 /// A lazy pipeline is built at its first use: until then a graphics one draws nothing, and a
-/// compute one is waited for on the title's thread. A retail title's first frames of its world
-/// use hundreds of pipelines for the first time at once. The pipelines of an earlier run are
-/// built while the title loads instead (`preload`): measured on a build that skips a dispatch
-/// instead of waiting for its pipeline, ~2 170 dispatches were skipped in those frames without
-/// this and 94 – 150 with it.
+/// compute one's dispatches are skipped (after a wait of up to `XCL_PSO_WAIT_MS`). A retail
+/// title's first frames of its world use hundreds of pipelines for the first time at once. The
+/// pipelines of an earlier run are built while the title loads instead (`preload`): measured on
+/// a build that skips a dispatch instead of waiting for its pipeline, ~2 170 dispatches were
+/// skipped in those frames without this and 94 – 150 with it.
 mod used {
     use std::collections::HashSet;
     use std::io::Write;
@@ -1194,7 +1193,8 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     }
 }
 
-/// For binding: compute pipelines are waited for, graphics ones are not.
+/// For binding: compute pipelines are waited for up to `XCL_PSO_WAIT_MS` (`resolve_wait`),
+/// graphics ones are not.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
         Some(p) if p.compute => resolve_wait(pso),
@@ -1221,8 +1221,9 @@ pub fn released(pso: usize) -> usize {
 }
 
 /// The pipeline of stand-in `pso` once its build is over: the real one, or the stand-in's
-/// driver pipeline when the build failed. Waits as long as that takes – for tools and tests,
-/// never for a bind (`resolve_wait`).
+/// driver pipeline when the build failed; `pso` itself at once when it is no stand-in (also with
+/// `XCL_ASYNC_PSO=0`: pipelines are built in the call, none is pending). Waits as long as the
+/// build takes – for tools and tests, never for a bind (`resolve_wait`).
 pub fn wait_built(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     if !p.sent.swap(true, Ordering::AcqRel) {
