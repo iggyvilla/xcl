@@ -203,7 +203,7 @@ fn mirror_program_through_the_hook(dev: &ID3D12Device) {
     unsafe { std::mem::ManuallyDrop::drop(&mut desc.pRootSignature) };
     let pso = pso.expect("CreateComputePipelineState through the backend hook");
     // built in the background behind a stand-in when its shader was not compiled yet
-    let real_raw = xcl::hle::d3d12x::pso_async::resolve_wait(pso.as_raw() as usize) as *mut std::ffi::c_void;
+    let real_raw = xcl::hle::d3d12x::pso_async::wait_built(pso.as_raw() as usize) as *mut std::ffi::c_void;
     let after = real::stats();
     assert_eq!(after.translated_pipelines, before.translated_pipelines + 1, "PSO was not built from the translated shader: {:?}", after.translation_errors);
     assert!(
@@ -342,7 +342,7 @@ fn async_compute_pso_registers_real_pso_and_not_standin() {
     let standin_raw = pso.as_raw() as usize;
 
     assert!(!real::is_translated_compute(standin_raw), "stand-in compute PSO must not be registered in TRANSLATED_COMPUTE");
-    let real_raw = pso_async::resolve_wait(standin_raw);
+    let real_raw = pso_async::wait_built(standin_raw);
     assert_ne!(real_raw, standin_raw, "cold DXIL cache must build compute PSO asynchronously behind a stand-in");
     assert!(real::is_translated_compute(real_raw), "background-built real compute PSO must be registered in TRANSLATED_COMPUTE");
     assert!(!real::is_translated_compute(standin_raw), "stand-in must remain unregistered after background build");
