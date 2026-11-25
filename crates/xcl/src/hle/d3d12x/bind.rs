@@ -1000,7 +1000,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
-    // a pipeline still being built in the background is waited for
+    // (only reached with a translated pipeline: built, `resolve_wait` returns it at once)
     let real = super::pso_async::resolve_wait(pso);
     // a compute shader takes no more arguments from registers than it has (`inline_for`)
     let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
