@@ -3805,9 +3805,23 @@ unsafe fn ensure_global_sampler_heap() -> Option<ID3D12DescriptorHeap> {
     super::console_heap::global_sampler_heap()
 }
 
+/// The shared shader-visible PC view heap, made now if a console device is live: the ABI root
+/// signatures are `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` with or without heap windows, so a
+/// translated draw or dispatch must never run with 0 view heaps bound (D3D12 #1419).
+unsafe fn ensure_global_view_heap() -> Option<ID3D12DescriptorHeap> {
+    if let Some(h) = super::console_heap::global_heap() {
+        return Some(h);
+    }
+    let dev_raw = real::device_raw();
+    if let Some(dev) = ID3D12Device::from_raw_borrowed(&dev_raw) {
+        let _ = super::console_heap::shared_heap(dev);
+    }
+    super::console_heap::global_heap()
+}
+
 /// Build the default PC descriptor heap list to bind when a command list is missing a required
-/// shader-visible view heap (`heap_windows`) or sampler heap (`SAMPLER_HEAP_DIRECTLY_INDEXED`).
-/// Returns `Some((heaps, has_sampler_heap))` when `SetDescriptorHeaps` must be updated.
+/// shader-visible view heap (`CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`) or sampler heap
+/// (`SAMPLER_HEAP_DIRECTLY_INDEXED`). Returns `Some((heaps, has_sampler_heap))` when `SetDescriptorHeaps` must be updated.
 fn default_bound_heaps(view: Option<usize>, sampler: Option<usize>, current: &[usize], has_sampler: bool) -> Option<(Vec<usize>, bool)> {
     if current.is_empty() {
         let mut out = Vec::with_capacity(2);
@@ -3865,15 +3879,10 @@ pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12D
 }
 
 /// Translated shaders with directly-indexed root signatures (`CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`
-/// / `SAMPLER_HEAP_DIRECTLY_INDEXED`) and heap windows (`pso::heap_windows`) require valid
-/// shader-visible view and sampler heaps to be bound even if the title bound 0 heaps (or only a
-/// view heap with 0 sampler heaps).
+/// / `SAMPLER_HEAP_DIRECTLY_INDEXED`) require valid shader-visible view and sampler heaps to be
+/// bound even if the title bound 0 heaps (or only one of the two), heap windows or not.
 pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
-    let view = if crate::gpu::recomp::pso::heap_windows() {
-        super::console_heap::global_heap()
-    } else {
-        None
-    };
+    let view = ensure_global_view_heap();
     let sampler = ensure_global_sampler_heap();
     let view_raw = view.as_ref().map(|h| h.as_raw() as usize);
     let sampler_raw = sampler.as_ref().map(|h| h.as_raw() as usize);
@@ -5392,10 +5401,8 @@ mod tests {
             ensure_view_heap(list);
             with_bindings(list, |b| bound = b.heaps.clone());
             let mut expected = Vec::new();
-            if crate::gpu::recomp::pso::heap_windows() {
-                if let Some(g) = super::super::console_heap::global_heap() {
-                    expected.push(g.as_raw() as usize);
-                }
+            if let Some(g) = super::super::console_heap::global_heap() {
+                expected.push(g.as_raw() as usize);
             }
             if let Some(s) = super::super::console_heap::global_sampler_heap() {
                 expected.push(s.as_raw() as usize);
@@ -5406,6 +5413,92 @@ mod tests {
             }
         }
         LISTS.lock().unwrap().as_mut().map(|m| m.remove(&(list as usize)));
+    }
+
+    /// Without heap windows (`XCL_HEAP_WINDOWS` unset, the default) the ABI root signatures are
+    /// still `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`: a list with no heaps bound, or only the title's
+    /// sampler heap, gets the shared view heap before a translated draw or dispatch, not the
+    /// sampler heap alone (D3D12 #1419).
+    #[test]
+    fn the_shared_view_heap_is_bound_without_heap_windows() {
+        const CHILD: &str = "XCL_TEST_VIEW_HEAP_NO_WINDOWS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::list_x::tests::the_shared_view_heap_is_bound_without_heap_windows", "--nocapture"])
+                .env(CHILD, "1")
+                .env("XCL_HEAP_WINDOWS", "0")
+                .output()
+                .unwrap();
+            let err = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{}\n{err}", String::from_utf8_lossy(&output.stdout));
+            // the child's skip line, so the parent reports it too
+            if let Some(line) = err.lines().find(|l| l.starts_with("SKIPPED")) {
+                eprintln!("{line}");
+            }
+            return;
+        }
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        assert!(!crate::gpu::recomp::pso::heap_windows());
+        #[repr(C)]
+        struct FakeList {
+            vt: *const usize,
+            calls: Mutex<Vec<Vec<usize>>>,
+        }
+        unsafe extern "system" fn fake_set_heaps(this: *mut c_void, n: u32, heaps: *const usize) {
+            let v = if heaps.is_null() { Vec::new() } else { std::slice::from_raw_parts(heaps, n as usize).to_vec() };
+            (*(this as *const FakeList)).calls.lock().unwrap().push(v);
+        }
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(warp) = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>()) else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            // what the title's first view heap makes (`real.rs`, CreateDescriptorHeap)
+            if !super::super::console_heap::shared_heap(&dev) {
+                crate::gpu::recomp::runner::skip_test("no shared view heap on this adapter");
+                return;
+            }
+            let view = super::super::console_heap::global_heap().unwrap().as_raw() as usize;
+            let title_sampler: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, NumDescriptors: 1, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 })
+                .unwrap();
+            let title_sampler = title_sampler.as_raw() as usize;
+
+            let mut orig_vt = [0usize; 64];
+            orig_vt[28] = fake_set_heaps as usize;
+            let mut ext_vt = vec![0usize; 65];
+            ext_vt[0] = orig_vt.as_ptr() as usize;
+            ext_vt[1..].copy_from_slice(&orig_vt);
+            let fake = Box::new(FakeList { vt: ext_vt.as_ptr().add(1), calls: Mutex::new(Vec::new()) });
+            let list = &*fake as *const FakeList as *mut c_void;
+            let mut bound = Vec::new();
+
+            // nothing bound: the shared view heap first (then the shared sampler heap, if any)
+            ensure_view_heap(list);
+            with_bindings(list, |b| bound = b.heaps.clone());
+            assert_eq!(bound.first(), Some(&view), "a list with no heaps gets the shared view heap");
+            assert_eq!(fake.calls.lock().unwrap().last(), Some(&bound));
+
+            // only the title's sampler heap: the shared view heap is put in front of it
+            with_bindings(list, |b| {
+                b.heaps = vec![title_sampler];
+                b.has_sampler_heap = true;
+            });
+            ensure_view_heap(list);
+            with_bindings(list, |b| bound = b.heaps.clone());
+            assert_eq!(bound, vec![view, title_sampler], "a sampler heap alone gets the shared view heap");
+            assert_eq!(fake.calls.lock().unwrap().last(), Some(&bound));
+            LISTS.lock().unwrap().as_mut().map(|m| m.remove(&(list as usize)));
+        }
     }
 
     #[test]
